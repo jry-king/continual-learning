@@ -13,7 +13,7 @@ from data import get_multitask_experiment
 from encoder import Classifier
 from vae_models import AutoEncoder
 import callbacks as cb
-from train import train_cl
+from train import train_cl, train_a_task, train_cl_new
 from continual_learner import ContinualLearner
 from exemplars import ExemplarHandler
 from replayer import Replayer
@@ -30,7 +30,7 @@ parser.add_argument('--results-dir', type=str, default='./results', dest='r_dir'
 
 # expirimental task parameters
 task_params = parser.add_argument_group('Task Parameters')
-task_params.add_argument('--experiment', type=str, default='splitMNIST', choices=['permMNIST', 'splitMNIST'])
+task_params.add_argument('--experiment', type=str, default='splitMNIST', choices=['permMNIST', 'splitMNIST', 'splitCIFAR10', 'splitCIFAR100'])
 task_params.add_argument('--scenario', type=str, default='class', choices=['task', 'domain', 'class'])
 task_params.add_argument('--tasks', type=int, help='number of tasks')
 
@@ -181,7 +181,13 @@ def run(args):
     #----------------#
 
     # Prepare data for chosen experiment
+    '''
     (train_datasets, test_datasets), config, classes_per_task = get_multitask_experiment(
+        name=args.experiment, scenario=scenario, tasks=args.tasks, data_dir=args.d_dir,
+        verbose=True, exception=True if args.seed==0 else False,
+    )
+    '''
+    (train_datasets, test_datasets, train_datasets_generator, test_datasets_generator), config, classes_per_task = get_multitask_experiment(
         name=args.experiment, scenario=scenario, tasks=args.tasks, data_dir=args.d_dir,
         verbose=True, exception=True if args.seed==0 else False,
     )
@@ -270,7 +276,7 @@ def run(args):
         model.mask_dict = mask_dict
         model.excit_buffer_list = excit_buffer_list
 
-
+    '''
     #-------------------------------------------------------------------------------------------------#
 
     #-------------------------------#
@@ -298,6 +304,43 @@ def run(args):
             generator.optimizer = optim.Adam(generator.optim_list, betas=(0.9, 0.999))
         elif generator.optim_type == "sgd":
             generator.optimizer = optim.SGD(generator.optim_list)
+    else:
+        generator = None
+
+
+    #-------------------------------------------------------------------------------------------------#
+    '''
+    #-------------------------------------------------------------------------------------------------#
+
+    #-------------------------------#
+    #----- CL-STRATEGY: REPLAY -----#
+    #-------------------------------#
+
+    # Use distillation loss (i.e., soft targets) for replayed data? (and set temperature)
+    if isinstance(model, Replayer):
+        model.replay_targets = "soft" if args.distill else "hard"
+        model.KD_temp = args.temp
+
+    # If needed, specify separate model for the generator, one VAE per class
+    train_gen = True if (args.replay=="generative" and not args.feedback) else False
+    if train_gen:
+        # -specify architecture
+        generators = []
+        for _ in range(config['classes']):
+            generator = AutoEncoder(
+                image_size=config['size'], image_channels=config['channels'],
+                fc_layers=args.g_fc_lay, fc_units=args.g_fc_uni, z_dim=args.g_z_dim, classes=1,
+                fc_drop=args.fc_drop, fc_bn=True if args.fc_bn=="yes" else False, fc_nl=args.fc_nl,
+            ).to(device)
+            # -set optimizer(s)
+            generator.optim_list = [{'params': filter(lambda p: p.requires_grad, generator.parameters()), 'lr': args.lr_gen}]
+            generator.optim_type = args.optimizer
+            if generator.optim_type in ("adam", "adam_reset"):
+                generator.optimizer = optim.Adam(generator.optim_list, betas=(0.9, 0.999))
+            elif generator.optim_type == "sgd":
+                generator.optimizer = optim.SGD(generator.optim_list)
+            generators.append(generator)
+        generator = generators[0]
     else:
         generator = None
 
@@ -390,7 +433,7 @@ def run(args):
     eval_cbs = [eval_cb, eval_cb_full]
     eval_cbs_exemplars = [eval_cb_exemplars]
 
-
+    '''
     #-------------------------------------------------------------------------------------------------#
 
     #--------------------#
@@ -449,7 +492,126 @@ def run(args):
 
 
     #-------------------------------------------------------------------------------------------------#
+    '''
+    #-------------------------------------------------------------------------------------------------#
 
+    #--------------------#
+    #----- TRAINING -----#
+    #--------------------#
+
+    print("--> Training:")
+    # Keep track of training-time
+    start = time.time()
+    # Train model
+    train_cl_new(
+        model, train_datasets, train_datasets_generator, replay_mode=args.replay, scenario=scenario, classes_per_task=classes_per_task,
+        iters=args.iters, batch_size=args.batch,
+        generators=generators, gen_iters=args.g_iters, gen_loss_cbs=generator_loss_cbs,
+        sample_cbs=sample_cbs, eval_cbs=eval_cbs, loss_cbs=generator_loss_cbs if args.feedback else solver_loss_cbs,
+        eval_cbs_exemplars=eval_cbs_exemplars, use_exemplars=args.use_exemplars, add_exemplars=args.add_exemplars,
+    )
+    # Get total training-time in seconds, and write to file
+    training_time = time.time() - start
+    time_file = open("{}/time-{}.txt".format(args.r_dir, param_stamp), 'w')
+    time_file.write('{}\n'.format(training_time))
+    time_file.close()
+
+
+    #-------------------------------------------------------------------------------------------------#
+
+    #----------------------#
+    #----- EVALUATION -----#
+    #----------------------#
+
+    print("\n\n--> Evaluation ({}-incremental learning scenario):".format(args.scenario))
+
+    # Evaluate precision of final model on full test-set
+    precs = [evaluate.validate(
+        model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=False,
+        allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
+    ) for i in range(args.tasks)]
+    print("\n Precision on test-set (softmax classification):")
+    for i in range(args.tasks):
+        print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
+    average_precs = sum(precs) / args.tasks
+    print('=> average precision over all {} tasks: {:.4f}'.format(args.tasks, average_precs))
+
+    # -with exemplars
+    if args.use_exemplars:
+        precs = [evaluate.validate(
+            model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=True,
+            allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
+        ) for i in range(args.tasks)]
+        print("\n Precision on test-set (classification using exemplars):")
+        for i in range(args.tasks):
+            print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
+        average_precs_ex = sum(precs) / args.tasks
+        print('=> average precision over all {} tasks: {:.4f}'.format(args.tasks, average_precs_ex))
+    print("\n")
+
+
+    #-------------------------------------------------------------------------------------------------#
+    '''
+    #-------------------------------------------------------------------------------------------------#
+
+    #--------------------#
+    #----- TRAINING -----#
+    #--------------------#
+
+    for task, train_dataset in enumerate(train_datasets, 1):
+
+        # Keep track of training-time
+        start = time.time()
+        # Train model
+        train_a_task(
+            model, task, train_dataset, train_datasets, replay_mode=args.replay, scenario=scenario, classes_per_task=classes_per_task,
+            iters=args.iters, batch_size=args.batch,
+            generator=generator, gen_iters=args.g_iters, gen_loss_cbs=generator_loss_cbs,
+            sample_cbs=sample_cbs, eval_cbs=eval_cbs, loss_cbs=generator_loss_cbs if args.feedback else solver_loss_cbs,
+            eval_cbs_exemplars=eval_cbs_exemplars, use_exemplars=args.use_exemplars, add_exemplars=args.add_exemplars,
+        )
+        # Get total training-time in seconds, and write to file
+        training_time = time.time() - start
+        time_file = open("{}/time-{}.txt".format(args.r_dir, param_stamp), 'w')
+        time_file.write('{}\n'.format(training_time))
+        time_file.close()
+
+
+        #-------------------------------------------------------------------------------------------------#
+
+        #----------------------#
+        #----- EVALUATION -----#
+        #----------------------#
+
+        print("\n\n--> Evaluation ({}-incremental learning scenario):".format(args.scenario))
+
+        # Evaluate precision of final model on full test-set
+        precs = [evaluate.validate(
+            model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=False,
+            allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
+        ) for i in range(args.tasks)]
+        print("\n Precision on test-set (softmax classification):")
+        for i in range(args.tasks):
+            print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
+        average_precs = sum(precs) / args.tasks
+        print('=> average precision over all {} tasks: {:.4f}'.format(args.tasks, average_precs))
+
+        # -with exemplars
+        if args.use_exemplars:
+            precs = [evaluate.validate(
+                model, test_datasets[i], verbose=False, test_size=None, task=i+1, with_exemplars=True,
+                allowed_classes=list(range(classes_per_task*i, classes_per_task*(i+1))) if scenario=="task" else None
+            ) for i in range(args.tasks)]
+            print("\n Precision on test-set (classification using exemplars):")
+            for i in range(args.tasks):
+                print(" - Task {}: {:.4f}".format(i + 1, precs[i]))
+            average_precs_ex = sum(precs) / args.tasks
+            print('=> average precision over all {} tasks: {:.4f}'.format(args.tasks, average_precs_ex))
+        print("\n")
+
+
+    #-------------------------------------------------------------------------------------------------#
+    '''
     #------------------#
     #----- OUTPUT -----#
     #------------------#

@@ -19,7 +19,7 @@ parser.add_argument('--results-dir', type=str, default='./results', dest='r_dir'
 
 # expirimental task parameters.
 task_params = parser.add_argument_group('Task Parameters')
-task_params.add_argument('--experiment', type=str, default='splitMNIST', choices=['permMNIST', 'splitMNIST'])
+task_params.add_argument('--experiment', type=str, default='splitMNIST', choices=['permMNIST', 'splitMNIST', 'splitCIFAR10', 'splitCIFAR100'])
 task_params.add_argument('--scenario', type=str, default='task', choices=['task', 'domain', 'class'])
 task_params.add_argument('--tasks', type=int, help='number of tasks')
 
@@ -233,7 +233,7 @@ if __name__ == '__main__':
         args.use_exemplars = True
         args.add_exemplars = True
         args.norm_exemplars = True
-        args.herding = True
+        # args.herding = True
         ICARL = {}
         ICARL = collect_all(ICARL, seed_list, args, name="iCaRL")
 

@@ -1,4 +1,3 @@
-import torch
 from torch.nn import functional as F
 from linear_nets import MLP,fc_layer
 from exemplars import ExemplarHandler
@@ -6,6 +5,28 @@ from continual_learner import ContinualLearner
 from replayer import Replayer
 import utils
 
+
+import torchvision
+import torch
+from torch import nn
+device = torch.device('cuda:0')
+'''
+class Simple_Classifier(nn.Module):
+    def __init__(self, n=2, backbone=torchvision.models.vgg.vgg19(pretrained=True).features.to(device)):
+        super(Simple_Classifier, self).__init__()
+        self.feature_extractor = backbone
+        self.fc1 = nn.Linear(512, 2048)
+        self.fc2 = nn.Linear(2048, 2048)
+        self.fc3 = nn.Linear(2048, n)  # parameter-awared layers had to initilize in construction function
+                
+    def forward(self, input):
+        x = self.feature_extractor(input)
+        x = nn.AdaptiveAvgPool2d(1)(x).squeeze()
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        logits = self.fc3(x)
+        return logits
+'''
 
 class Classifier(ContinualLearner, Replayer, ExemplarHandler):
     '''Model for classifying images, "enriched" as "ContinualLearner"-, Replayer- and ExemplarHandler-object.'''
@@ -30,7 +51,7 @@ class Classifier(ContinualLearner, Replayer, ExemplarHandler):
 
 
         ######------SPECIFY MODEL------######
-
+        '''
         # flatten image to 2D-tensor
         self.flatten = utils.Flatten()
 
@@ -42,10 +63,31 @@ class Classifier(ContinualLearner, Replayer, ExemplarHandler):
 
         # classifier
         self.classifier = fc_layer(mlp_output_size, classes, excit_buffer=True, nl='none', drop=fc_drop)
+        '''
 
+        self.featureextractor = torchvision.models.vgg.vgg19(pretrained=True).features.to(device)
+        self.fc1 = nn.Linear(512, 2048)
+        self.fc2 = nn.Linear(2048, 2048)
+        self.fc3 = nn.Linear(2048, classes)
 
+    @property
+    def name(self):
+        return "Simple_Classifier([512, 2048, 2048])"
+
+    def forward(self, input):
+        x = self.featureextractor(input)
+        x = nn.AdaptiveAvgPool2d(1)(x).squeeze()
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        logits = self.fc3(x)
+        return logits
+
+    def feature_extractor(self, images):
+        return self.featureextractor(images)
+
+    '''
     def list_init_layers(self):
-        '''Return list of modules whose parameters could be initialized differently (i.e., conv- or fc-layers).'''
+        """Return list of modules whose parameters could be initialized differently (i.e., conv- or fc-layers)."""
         list = []
         list += self.fcE.list_init_layers()
         list += self.classifier.list_init_layers()
@@ -62,7 +104,7 @@ class Classifier(ContinualLearner, Replayer, ExemplarHandler):
 
     def feature_extractor(self, images):
         return self.fcE(self.flatten(images))
-
+    '''
 
     def train_a_batch(self, x, y, scores=None, x_=None, y_=None, scores_=None, rnt=0.5, active_classes=None, task=1):
         '''Train model for one batch ([x],[y]), possibly supplemented with replayed data ([x_],[y_/scores_]).
