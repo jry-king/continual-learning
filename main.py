@@ -326,7 +326,8 @@ def run(args):
     if train_gen:
         # -specify architecture
         generators = []
-        for _ in range(config['classes']):
+        classnum = config['classes'] * args.tasks if scenario == "domain" else config['classes']
+        for _ in range(classnum):
             generator = AutoEncoder(
                 image_size=config['size'], image_channels=config['channels'],
                 fc_layers=args.g_fc_lay, fc_units=args.g_fc_uni, z_dim=args.g_z_dim, classes=1,

@@ -433,11 +433,11 @@ def train_cl_new(model, train_datasets, train_datasets_generator, replay_mode="n
 
         # Define tqdm progress bar(s)
         progress = tqdm.tqdm(range(1, iters+1))
-        if generator is not None:
+        if generators is not None:
             progress_gen = tqdm.tqdm(range(1, gen_iters+1))
 
         # Loop over all iterations
-        iters_to_use = iters if (generator is None) else max(iters, gen_iters)
+        iters_to_use = iters if (generators is None) else max(iters, gen_iters)
         for batch_index in range(1, iters_to_use+1):
 
             # Update # iters left on current data-loader(s) and, if needed, create new one(s)
@@ -446,7 +446,10 @@ def train_cl_new(model, train_datasets, train_datasets_generator, replay_mode="n
                 data_loader = iter(utils.get_data_loader(training_dataset, batch_size, cuda=cuda, drop_last=True))
                 # NOTE:  [train_dataset]  is training-set of current task
                 #      [training_dataset] is training-set of current task with stored exemplars added (if requested)
-                iters_left = len(data_loader)
+                data_loaders_generator = []      # dataloaders for training new generators and getting labels for replayed data
+                for i in range(classes_per_task * task):
+                    data_loaders_generator.append(iter(utils.get_data_loader(train_datasets_generator[i], batch_size, cuda=cuda, drop_last=True)))
+                iters_left = min(len(data_loader), len(data_loaders_generator[0]))
             if Exact:
                 if scenario=="task":
                     up_to_task = task if replay_mode=="offline" else task-1
@@ -531,7 +534,11 @@ def train_cl_new(model, train_datasets, train_datasets_generator, replay_mode="n
             ##-->> Generative / Current Replay <<--##
             if Generative or Current:
                 # Get replayed data (i.e., [x_]) -- either current data or use previous generator
-                x_ = x if Current else previous_generator.sample(batch_size)
+                if Current:
+                    x_ = x
+                else:
+                    for i in range(classes_per_task * (task - 1)):
+                        x_ = torch.cat([x_, generators[i].sample(batch_size)]) if i > 0 else generators[0].sample(batch_size)
 
                 # Get target scores and labels (i.e., [scores_] / [y_]) -- using previous model, with no_grad()
                 # -if there are no task-specific mask, obtain all predicted scores at once
@@ -543,7 +550,11 @@ def train_cl_new(model, train_datasets, train_datasets_generator, replay_mode="n
                         (not hasattr(previous_model, "mask_dict")) or (previous_model.mask_dict is None)
                 ):
                     scores_ = all_scores_[:,:(classes_per_task * (task - 1))] if scenario == "class" else all_scores_
-                    _, y_ = torch.max(scores_, dim=1)
+                    # _, y_ = torch.max(scores_, dim=1)
+                    for i in range(classes_per_task * (task - 1)):
+                        _, temp_y_ = next(data_loaders_generator[i])
+                        temp_y_ = temp_y_.to(device) if (model.replay_targets=="hard") else None
+                        y_ = torch.cat([y_, temp_y_]) if i > 0 else temp_y_
                 else:
                     # NOTE: it's possible to have scenario=domain with task-mask (so actually it's the Task-IL scenario)
                     # -[x_] needs to be evaluated according to each previous task, so make list with entry per task
@@ -599,26 +610,30 @@ def train_cl_new(model, train_datasets, train_datasets_generator, replay_mode="n
 
 
             #---> Train GENERATOR
-            if generator is not None and batch_index <= gen_iters:
+            if generators is not None and batch_index <= gen_iters:
 
                 # Train the generator with this batch
-                loss_dict = generator.train_a_batch(x, y, x_=x_, y_=y_, scores_=scores_, active_classes=active_classes,
-                                                    task=task, rnt=1./task)
+                for i in range(classes_per_task * (task - 1), classes_per_task * task):
+                    x, y = next(data_loaders_generator[i])
+                    y = y-classes_per_task*(task-1) if scenario=="task" else y
+                    x, y = x.to(device), y.to(device)
+                    loss_dict = generators[i].train_a_batch(x, y, x_=x_, y_=y_, scores_=scores_, active_classes=active_classes,
+                                                            task=task, rnt=1./task)
 
-                # Fire callbacks on each iteration
-                for loss_cb in gen_loss_cbs:
-                    if loss_cb is not None:
-                        loss_cb(progress_gen, batch_index, loss_dict, task=task)
-                for sample_cb in sample_cbs:
-                    if sample_cb is not None:
-                        sample_cb(generator, batch_index, task=task)
+                    # Fire callbacks on each iteration
+                    for loss_cb in gen_loss_cbs:
+                        if loss_cb is not None:
+                            loss_cb(progress_gen, batch_index, loss_dict, task=task)
+                    for sample_cb in sample_cbs:
+                        if sample_cb is not None:
+                            sample_cb(generator, batch_index, task=task)
 
 
         ##----------> UPON FINISHING EACH TASK...
 
         # Close progres-bar(s)
         progress.close()
-        if generator is not None:
+        if generators is not None:
             progress_gen.close()
 
         # EWC: estimate Fisher Information matrix (FIM) and update term for quadratic penalty
@@ -662,7 +677,6 @@ def train_cl_new(model, train_datasets, train_datasets_generator, replay_mode="n
         previous_model = copy.deepcopy(model).eval()
         if replay_mode == 'generative':
             Generative = True
-            previous_generator = copy.deepcopy(generator).eval() if generator is not None else previous_model
         elif replay_mode == 'current':
             Current = True
         elif replay_mode in ('exemplars', 'exact'):
